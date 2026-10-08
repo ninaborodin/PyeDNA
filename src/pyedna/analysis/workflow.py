@@ -1,6 +1,7 @@
 """High-level trajectory-analysis workflow orchestration."""
 
 from pyedna.analysis.io import (
+    AnalysisJsonlWriter,
     analysis_run_in_directory,
     append_classical_interaction_results,
     append_classical_results,
@@ -9,6 +10,7 @@ from pyedna.analysis.io import (
     create_analysis_run,
     write_manifest,
 )
+from pyedna.analysis.serialization import build_result_schemas
 from pyedna.analysis.classical import run_classical_jobs, summarize_classical_result
 from pyedna.analysis.interactions import (
     run_classical_interactions,
@@ -42,6 +44,7 @@ def run_trajectory_analysis(config_file="traj.toml"):
     basis = traj_cfg.get("basis", quantum_defaults.get("basis", "6-31g"))
     analysis_run = create_analysis_run(cfg, config_file=config_file)
     write_manifest(cfg, analysis_run, trajectories=trajectories)
+    result_schemas = build_result_schemas(cfg)
     print(f"Analysis output: {analysis_run.directory}")
     print(
         "Runtime resources: "
@@ -70,18 +73,21 @@ def run_trajectory_analysis(config_file="traj.toml"):
             f"{target['trajectory_index']}: {target['trajectory_file']}"
         )
 
-        for frame in range(start, stop + 1):
-            analyze_frame(
-                cfg,
-                traj,
-                frame,
-                target_run,
-                attachments=attachments,
-                optimize_caps=optimize_caps,
-                basis=basis,
-                resources=resources,
-                metadata=metadata,
-            )
+        frame_stride = traj_cfg.get("frame_stride", 1)
+        with AnalysisJsonlWriter(target_run, result_schemas) as writer:
+            for frame in range(start, stop + 1, frame_stride):
+                analyze_frame(
+                    cfg,
+                    traj,
+                    frame,
+                    target_run,
+                    attachments=attachments,
+                    optimize_caps=optimize_caps,
+                    basis=basis,
+                    resources=resources,
+                    metadata=metadata,
+                    writer=writer,
+                )
 
     return analysis_run
 
@@ -96,13 +102,15 @@ def analyze_frame(
     basis="6-31g",
     resources=None,
     metadata=None,
+    writer=None,
 ):
     resources = detect_runtime_resources() if resources is None else resources
+    attachment_snapshots = {}
     attachment_mols = {}
 
     for attachment in attachments or config.get("attachments", []):
         residue = attachment["residue"]
-        attachment_mols[residue] = traj.get_capped_snapshot(
+        snapshot = traj.get_capped_attachment_snapshot(
             frame=frame,
             initial_residue=residue,
             dye=attachment["dye"],
@@ -111,6 +119,8 @@ def analyze_frame(
             basis=basis,
             resources=resources,
         )
+        attachment_snapshots[residue] = snapshot
+        attachment_mols[residue] = snapshot.molecule
 
     groups = build_groups(config, attachment_mols, basis=basis)
     group_fragments = build_group_fragments(config, attachment_mols)
@@ -121,8 +131,14 @@ def analyze_frame(
             f"{mol.natm} atoms, charge {mol.charge}"
         )
 
-    classical_results = run_classical_jobs(config, groups, frame)
-    append_classical_results(analysis_run, classical_results, metadata=metadata)
+    classical_results = run_classical_jobs(
+        config,
+        groups,
+        frame,
+        attachment_snapshots=attachment_snapshots,
+    )
+    if writer is None:
+        append_classical_results(analysis_run, classical_results, metadata=metadata)
 
     for result in classical_results:
         print(summarize_classical_result(result))
@@ -134,17 +150,19 @@ def analyze_frame(
         group_fragments=group_fragments,
         resources=resources,
     )
-    append_quantum_results(analysis_run, quantum_results, metadata=metadata)
+    if writer is None:
+        append_quantum_results(analysis_run, quantum_results, metadata=metadata)
 
     for result in quantum_results:
         print(summarize_quantum_result(result))
 
     quantum_interaction_results = run_quantum_interactions(config, quantum_results)
-    append_quantum_interaction_results(
-        analysis_run,
-        quantum_interaction_results,
-        metadata=metadata,
-    )
+    if writer is None:
+        append_quantum_interaction_results(
+            analysis_run,
+            quantum_interaction_results,
+            metadata=metadata,
+        )
 
     for result in quantum_interaction_results:
         print(summarize_interaction_result(result))
@@ -153,15 +171,26 @@ def analyze_frame(
         config,
         groups=groups,
         frame=frame,
+        attachment_snapshots=attachment_snapshots,
     )
-    append_classical_interaction_results(
-        analysis_run,
-        classical_interaction_results,
-        metadata=metadata,
-    )
+    if writer is None:
+        append_classical_interaction_results(
+            analysis_run,
+            classical_interaction_results,
+            metadata=metadata,
+        )
 
     for result in classical_interaction_results:
         print(summarize_interaction_result(result))
+
+    if writer is not None:
+        writer.write_frame(
+            frame,
+            classical=classical_results,
+            classical_interactions=classical_interaction_results,
+            quantum=quantum_results,
+            quantum_interactions=quantum_interaction_results,
+        )
 
     return {
         "groups": groups,
